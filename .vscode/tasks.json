@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Expo: Start Metro",
+      "type": "shell",
+      "command": "npm run start:dev",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "expo"
+      }
+    },
+    {
+      "label": "Android: Stream JS Logs (adb)",
+      "type": "shell",
+      "command": "npm run logs:android",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "android-logs"
+      }
+    },
+    {
+      "label": "Android: Build & Install on Device",
+      "type": "shell",
+      "command": "npm run android:device",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "expo"
+      }
+    }
+  ]
+}

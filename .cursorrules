@@ -1,0 +1,12 @@
+# Project Context
+You are an expert React Native / Expo developer building "Alpha Rounds" (alpha-rounds), an Android utility app that manages automated testing queues for developers needing closed beta testers.
+
+# Code Style & Preferences
+- Write clean, modular, functional React Native components using TypeScript/JavaScript.
+- Use standard 'react-native' StyleSheet objects for UI styling unless Tailwind/NativeWind is explicitly added later.
+- Ensure all mobile touch targets are accessible (minimum 44x44 dp) and layouts are highly scannable.
+- Prioritize clear visual state indicators (e.g., Pending vs. Completed states).
+
+# Framework Guardrails
+- This is a managed Expo project. Avoid adding raw, unlinked native Java/Kotlin code directly to the source directory.
+- Utilize native permissions through Expo-compatible modules or custom Config Plugins when handling system-level tasks.
