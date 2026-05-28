@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { StyleSheet, Text, View, ScrollView, TouchableOpacity, StatusBar, Modal, TextInput, Alert, Linking, Platform, AppState } from 'react-native';
+import { StyleSheet, Text, View, ScrollView, TouchableOpacity, StatusBar, Modal, TextInput, Alert, Linking, Platform, AppState, NativeModules } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import * as Haptics from 'expo-haptics';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
+import SendIntentAndroid from 'react-native-send-intent';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -17,11 +19,19 @@ Notifications.setNotificationHandler({
 const CYCLE_DURATION_SECONDS = 300;
 const NOTIFICATION_CHANNEL_ID = 'round-complete';
 const MAX_ACTIVITY_LOGS = 100;
+const KEEP_AWAKE_TAG = 'alpha-rounds-cycle';
+const AUDIT_VERIFIED_PERCENT = 0.8;
+const AUDIT_VERIFIED_MIN_SECONDS = 240;
+const AUDIT_REQUIRED_SECONDS = Math.max(
+  Math.ceil(CYCLE_DURATION_SECONDS * AUDIT_VERIFIED_PERCENT),
+  AUDIT_VERIFIED_MIN_SECONDS
+);
 
 const STORAGE_KEYS = {
   testApps: '@alpha-rounds/testApps',
   activityLogs: '@alpha-rounds/activityLogs',
   cycleState: '@alpha-rounds/cycleState',
+  selectedAppPackage: '@alpha-rounds/selectedAppPackage',
 };
 
 const DEFAULT_TEST_APPS = [
@@ -30,6 +40,14 @@ const DEFAULT_TEST_APPS = [
   { id: '3', name: 'BudgetBuddy', developer: 'SarahK', dayStreak: 2, status: 'pending', packageName: 'com.google.android.apps.walletnfcrel' },
   { id: '4', name: 'CryptoPulse Overlay', developer: 'CryptoDev', dayStreak: 14, status: 'completed', packageName: 'com.google.android.youtube' },
   { id: '5', name: 'RecipeScaler', developer: 'ChefApps', dayStreak: 8, status: 'pending', packageName: 'com.google.android.apps.maps' },
+];
+const TESTING_APPS_REGISTRY = [
+  { label: "ServiceLog", packageId: "com.saintjerome.servicelog" }, // ◄ Add this line!
+  { label: "Settings", packageId: "com.android.settings" },
+  { label: "Chrome", packageId: "com.android.chrome" },
+  { label: "YouTube", packageId: "com.google.android.youtube" },
+  { label: "Maps", packageId: "com.google.android.apps.maps" },
+  { label: "Drive", packageId: "com.google.android.apps.docs" },
 ];
 
 let scheduledRoundNotificationId = null;
@@ -106,6 +124,7 @@ const getRemainingSeconds = (endsAt) => {
 };
 
 export default function App() {
+  const { UsageStatsModule } = NativeModules;
   const [isHydrated, setIsHydrated] = useState(false);
   const [testApps, setTestApps] = useState(DEFAULT_TEST_APPS);
   const [activityLogs, setActivityLogs] = useState([]);
@@ -115,6 +134,7 @@ export default function App() {
   const [newAppName, setNewAppName] = useState('');
   const [newDevName, setNewDevName] = useState('');
   const [newPackageName, setNewPackageName] = useState('');
+  const [selectedAppPackage, setSelectedAppPackage] = useState(TESTING_APPS_REGISTRY[0].packageId);
 
   const [currentActiveApp, setCurrentActiveApp] = useState(null);
   const [isCycleActive, setIsCycleActive] = useState(false);
@@ -127,6 +147,7 @@ export default function App() {
   const timerEndsAtRef = useRef(timerEndsAt);
   const isAdvancingRef = useRef(false);
   const pausedRemainingRef = useRef(CYCLE_DURATION_SECONDS);
+  const activeAuditSessionRef = useRef(null);
 
   const appendActivityLog = useCallback((type, message, appName = null) => {
     const entry = {
@@ -162,10 +183,11 @@ export default function App() {
   useEffect(() => {
     const hydrate = async () => {
       try {
-        const [appsJson, logsJson, cycleJson] = await Promise.all([
+        const [appsJson, logsJson, cycleJson, selectedAppPackageJson] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.testApps),
           AsyncStorage.getItem(STORAGE_KEYS.activityLogs),
           AsyncStorage.getItem(STORAGE_KEYS.cycleState),
+          AsyncStorage.getItem(STORAGE_KEYS.selectedAppPackage),
         ]);
 
         const hydratedApps = appsJson ? JSON.parse(appsJson) : DEFAULT_TEST_APPS;
@@ -174,6 +196,15 @@ export default function App() {
 
         if (logsJson) {
           setActivityLogs(JSON.parse(logsJson));
+        }
+
+        if (selectedAppPackageJson) {
+          const isKnownPackage = TESTING_APPS_REGISTRY.some(
+            (entry) => entry.packageId === selectedAppPackageJson
+          );
+          if (isKnownPackage) {
+            setSelectedAppPackage(selectedAppPackageJson);
+          }
         }
 
         if (cycleJson) {
@@ -223,6 +254,11 @@ export default function App() {
     if (!isHydrated) return;
     AsyncStorage.setItem(STORAGE_KEYS.activityLogs, JSON.stringify(activityLogs));
   }, [activityLogs, isHydrated]);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+    AsyncStorage.setItem(STORAGE_KEYS.selectedAppPackage, selectedAppPackage);
+  }, [selectedAppPackage, isHydrated]);
 
   useEffect(() => {
     if (!isHydrated) return;
@@ -280,29 +316,134 @@ export default function App() {
 
   const launchTargetApp = useCallback(async (packageName) => {
     const pkg = packageName?.trim();
-    if (!pkg) return;
+    if (!pkg) return false;
 
     if (Platform.OS !== 'android') {
       Alert.alert('Android Only', 'Package launching is only supported on Android devices.');
-      return;
-    }
-
-    const intentUrl = `intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;package=${pkg};end`;
-
-    try {
-      await Linking.openURL(intentUrl);
-      return;
-    } catch {
-      // Fall through to Play Store deep link if the app is not installed.
+      return false;
     }
 
     try {
-      await Linking.openURL(`market://details?id=${pkg}`);
-    } catch {
+      const isAppInstalled = await SendIntentAndroid.isAppInstalled(pkg);
+      if (isAppInstalled) {
+        SendIntentAndroid.openApp(pkg);
+        return true;
+      }
+
+      Alert.alert('App Not Installed', `App package ${pkg} is not installed on this device.`);
+      return false;
+    } catch (error) {
+      console.error('Native intent launch failed:', error);
       Alert.alert(
         'Unable to Launch App',
         `Could not open "${pkg}". Verify the package name and that the app is installed.`
       );
+      return false;
+    }
+  }, []);
+
+  const formatMsAsClock = useCallback((milliseconds) => {
+    const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }, []);
+
+  const beginUsageAudit = useCallback((app, packageOverride = null) => {
+    const auditPackage = packageOverride || app?.packageName;
+    if (!auditPackage) return;
+    activeAuditSessionRef.current = {
+      appName: app.name,
+      packageName: auditPackage,
+      startTime: Date.now(),
+    };
+  }, []);
+
+  const finalizeUsageAudit = useCallback(async (reason = 'session_end') => {
+    const session = activeAuditSessionRef.current;
+    if (!session) return { verified: true, activeMs: 0, windowMs: 0 };
+    activeAuditSessionRef.current = null;
+
+    const stopTime = Date.now();
+    if (Platform.OS !== 'android') return { verified: true, activeMs: 0, windowMs: 0 };
+    if (!UsageStatsModule?.getTotalTimeInForeground || !UsageStatsModule?.hasUsageStatsPermission) {
+      return { verified: true, activeMs: 0, windowMs: 0 };
+    }
+
+    try {
+      const hasPermission = await UsageStatsModule.hasUsageStatsPermission();
+      if (!hasPermission) {
+        appendActivityLog(
+          'usage_audit_permission_missing',
+          `Usage access is required to verify active time for ${session.appName}.`,
+          session.appName
+        );
+        Alert.alert(
+          'Enable Usage Access',
+          'Grant "Usage Access" for Alpha Rounds to verify real foreground testing time.',
+          [
+            { text: 'Not now', style: 'cancel' },
+            {
+              text: 'Open settings',
+              onPress: () => UsageStatsModule.openUsageAccessSettings?.(),
+            },
+          ]
+        );
+        return {
+          verified: false,
+          activeMs: 0,
+          windowMs: Math.max(0, stopTime - session.startTime),
+        };
+      }
+
+      const activeMs = await UsageStatsModule.getTotalTimeInForeground(
+        session.packageName,
+        session.startTime,
+        stopTime
+      );
+      const windowMs = Math.max(0, stopTime - session.startTime);
+      const activeClock = formatMsAsClock(activeMs);
+      const windowClock = formatMsAsClock(windowMs);
+      const verified = reason !== 'round_complete'
+        ? true
+        : activeMs >= AUDIT_REQUIRED_SECONDS * 1000;
+
+      appendActivityLog(
+        'usage_audit',
+        `${session.appName}: active ${activeClock} of ${windowClock} (${reason})${verified ? '' : ' • NOT VERIFIED'}`,
+        session.appName
+      );
+
+      Alert.alert(
+        'Session Audit',
+        `${session.appName}\nActive in target app: ${activeClock}\nAudit window: ${windowClock}${reason === 'round_complete' ? `\nVerified: ${verified ? 'Yes' : `No (minimum ${formatTimer(AUDIT_REQUIRED_SECONDS)})`}` : ''}`
+      );
+      return { verified, activeMs, windowMs };
+    } catch (error) {
+      console.warn('[Alpha Rounds] usage audit failed:', error);
+      appendActivityLog(
+        'usage_audit_error',
+        `Unable to verify active foreground time for ${session.appName}.`,
+        session.appName
+      );
+      return {
+        verified: false,
+        activeMs: 0,
+        windowMs: Math.max(0, stopTime - session.startTime),
+      };
+    }
+  }, [UsageStatsModule, appendActivityLog, formatMsAsClock]);
+
+  const syncKeepAwake = useCallback(async (enabled) => {
+    if (Platform.OS !== 'android') return;
+    try {
+      if (enabled) {
+        await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      } else {
+        deactivateKeepAwake(KEEP_AWAKE_TAG);
+      }
+    } catch (error) {
+      console.warn('[Alpha Rounds] keep-awake toggle failed:', error);
     }
   }, []);
 
@@ -329,12 +470,33 @@ export default function App() {
     setIsModalVisible(false);
   };
 
-  const advanceToNextApp = useCallback(() => {
+  const advanceToNextApp = useCallback(async () => {
     const activeApp = currentActiveAppRef.current;
     if (!activeApp || isAdvancingRef.current) return;
 
     isAdvancingRef.current = true;
     cancelRoundEndNotification();
+    const auditResult = await finalizeUsageAudit('round_complete');
+    if (!auditResult?.verified) {
+      appendActivityLog(
+        'round_not_verified',
+        `${activeApp.name} did not meet the active-time threshold (${formatTimer(AUDIT_REQUIRED_SECONDS)} minimum). Retrying round.`,
+        activeApp.name
+      );
+      Alert.alert(
+        'Round Not Counted',
+        `This round for ${activeApp.name} was not counted.\n\nYou need at least ${formatTimer(AUDIT_REQUIRED_SECONDS)} of active foreground time in the target app.`
+      );
+      beginTimer(CYCLE_DURATION_SECONDS, activeApp.name);
+      const didLaunch = await launchTargetApp(selectedAppPackage || activeApp.packageName || 'com.android.settings');
+      if (didLaunch) {
+        beginUsageAudit(activeApp, selectedAppPackage || activeApp.packageName);
+      }
+      setTimeout(() => {
+        isAdvancingRef.current = false;
+      }, 0);
+      return;
+    }
 
     const updatedApps = testAppsRef.current.map((app) =>
       app.id === activeApp.id ? { ...app, status: 'completed' } : app
@@ -351,6 +513,10 @@ export default function App() {
       currentActiveAppRef.current = nextPending;
       setIsTimerPaused(false);
       beginTimer(CYCLE_DURATION_SECONDS, nextPending.name);
+      const didLaunch = await launchTargetApp(selectedAppPackage || nextPending.packageName || 'com.android.settings');
+      if (didLaunch) {
+        beginUsageAudit(nextPending, selectedAppPackage || nextPending.packageName);
+      }
     } else {
       setCurrentActiveApp(null);
       currentActiveAppRef.current = null;
@@ -369,9 +535,9 @@ export default function App() {
     setTimeout(() => {
       isAdvancingRef.current = false;
     }, 0);
-  }, [appendActivityLog, beginTimer]);
+  }, [appendActivityLog, beginTimer, beginUsageAudit, finalizeUsageAudit, launchTargetApp, selectedAppPackage]);
 
-  const startCycle = () => {
+  const startCycle = async () => {
     const firstPending = testApps.find((app) => app.status === 'pending');
     if (!firstPending) {
       Alert.alert('No Pending Apps', 'All apps in your queue are already completed.');
@@ -383,10 +549,15 @@ export default function App() {
     setIsTimerPaused(false);
     setIsCycleActive(true);
     beginTimer(CYCLE_DURATION_SECONDS, firstPending.name);
+    const didLaunch = await launchTargetApp(selectedAppPackage || firstPending.packageName || 'com.android.settings');
+    if (didLaunch) {
+      beginUsageAudit(firstPending, selectedAppPackage || firstPending.packageName);
+    }
     appendActivityLog('cycle_start', `Started automated cycle with ${firstPending.name}`, firstPending.name);
   };
 
   const cancelCycle = async () => {
+    await finalizeUsageAudit('cycle_cancel');
     await cancelRoundEndNotification();
     if (currentActiveApp) {
       appendActivityLog('cycle_cancel', `Cancelled cycle during ${currentActiveApp.name}`, currentActiveApp.name);
@@ -400,8 +571,9 @@ export default function App() {
     timerEndsAtRef.current = null;
   };
 
-  const skipCurrentApp = () => {
+  const skipCurrentApp = async () => {
     if (!currentActiveApp) return;
+    await finalizeUsageAudit('round_skip');
     appendActivityLog('round_skip', `Skipped ${currentActiveApp.name}`, currentActiveApp.name);
     cancelRoundEndNotification();
     timerEndsAtRef.current = Date.now();
@@ -453,12 +625,13 @@ export default function App() {
     const subscription = AppState.addEventListener('change', (nextState) => {
       setAppState(nextState);
       if (nextState === 'active') {
+        finalizeUsageAudit('returned_to_alpha_rounds');
         syncTimerFromClock();
       }
     });
 
     return () => subscription.remove();
-  }, [syncTimerFromClock]);
+  }, [finalizeUsageAudit, syncTimerFromClock]);
 
   useEffect(() => {
     if (!isHydrated || !isCycleActive || isTimerPaused || !timerEndsAt) return;
@@ -469,15 +642,21 @@ export default function App() {
   }, [isHydrated, isCycleActive, isTimerPaused, timerEndsAt, advanceToNextApp]);
 
   useEffect(() => {
-    if (!currentActiveApp?.packageName) return;
-    launchTargetApp(currentActiveApp.packageName);
-  }, [currentActiveApp, launchTargetApp]);
+    syncKeepAwake(isCycleActive && !isTimerPaused);
+  }, [isCycleActive, isTimerPaused, syncKeepAwake]);
+
+  useEffect(() => {
+    return () => {
+      syncKeepAwake(false);
+    };
+  }, [syncKeepAwake]);
 
   const totalApps = testApps.length;
   const completedApps = testApps.filter(app => app.status === 'completed').length;
   const pendingApps = testApps.filter(app => app.status === 'pending').length;
   const progressPercent = totalApps > 0 ? (completedApps / totalApps) * 100 : 0;
   const isAppInBackground = appState !== 'active';
+  const selectedRegistryApp = TESTING_APPS_REGISTRY.find((app) => app.packageId === selectedAppPackage);
 
   const clearActivityLogs = () => {
     setActivityLogs([]);
@@ -560,6 +739,11 @@ export default function App() {
         </View>
       ) : (
         <>
+      <ScrollView
+        style={styles.dashboardScroll}
+        contentContainerStyle={styles.dashboardScrollContent}
+        showsVerticalScrollIndicator={false}
+      >
       <View style={styles.dashboardHeader}>
         <Text style={styles.dashboardTitle}>Alpha Rounds</Text>
         <TouchableOpacity
@@ -607,6 +791,33 @@ export default function App() {
           </View>
         )}
 
+        <View style={styles.registryCard}>
+          <Text style={styles.registryTitle}>Testing Target App</Text>
+          <Text style={styles.registrySubtitle}>
+            Selected: {selectedRegistryApp?.label || selectedAppPackage}
+          </Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.registryRow}>
+            {TESTING_APPS_REGISTRY.map((registryApp) => {
+              const isSelected = selectedAppPackage === registryApp.packageId;
+              return (
+                <TouchableOpacity
+                  key={registryApp.packageId}
+                  style={[styles.registryButton, isSelected && styles.registryButtonSelected]}
+                  activeOpacity={0.8}
+                  onPress={() => setSelectedAppPackage(registryApp.packageId)}
+                >
+                  <Text style={[styles.registryButtonLabel, isSelected && styles.registryButtonLabelSelected]}>
+                    {registryApp.label}
+                  </Text>
+                  <Text style={styles.registryButtonPackage} numberOfLines={1}>
+                    {registryApp.packageId}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+        </View>
+
         {/* Primary Action Button */}
         <TouchableOpacity
           style={[styles.primaryButton, pendingApps === 0 && styles.primaryButtonDisabled]}
@@ -617,12 +828,7 @@ export default function App() {
           <Text style={styles.primaryButtonText}>Start Automated Test Cycle</Text>
         </TouchableOpacity>
       </View>
-
-      <ScrollView
-        style={styles.dashboardScroll}
-        contentContainerStyle={styles.dashboardScrollContent}
-        showsVerticalScrollIndicator={false}
-      >
+      
         <View style={styles.sectionHeaderRow}>
           <Text style={styles.sectionTitle}>Your Testing Queue</Text>
           <Text style={styles.sectionCount}>{testApps.length} apps</Text>
@@ -682,7 +888,7 @@ export default function App() {
         </View>
       </View>
       </ScrollView>
-
+      
       <Modal
         visible={isModalVisible}
         transparent
@@ -865,6 +1071,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   dashboardScrollContent: {
+    flexGrow: 1,
     paddingHorizontal: 16,
     paddingBottom: 32,
   },
@@ -936,6 +1143,57 @@ const styles = StyleSheet.create({
     color: '#6366F1',
     fontSize: 14,
     fontWeight: '700',
+  },
+  registryCard: {
+    backgroundColor: '#121214',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2A2A32',
+    padding: 12,
+    marginBottom: 16,
+  },
+  registryTitle: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  registrySubtitle: {
+    color: '#A1A1AA',
+    fontSize: 12,
+    marginBottom: 10,
+  },
+  registryRow: {
+    gap: 8,
+    paddingRight: 4,
+  },
+  registryButton: {
+    minWidth: 140,
+    maxWidth: 180,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#3F3F46',
+    backgroundColor: '#1A1A1E',
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+  },
+  registryButtonSelected: {
+    borderColor: '#6366F1',
+    backgroundColor: 'rgba(99, 102, 241, 0.18)',
+  },
+  registryButtonLabel: {
+    color: '#E4E4E7',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  registryButtonLabelSelected: {
+    color: '#FFFFFF',
+  },
+  registryButtonPackage: {
+    color: '#71717A',
+    fontSize: 11,
+    marginTop: 4,
+    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier',
   },
   appRow: {
     backgroundColor: '#1A1A1E',
